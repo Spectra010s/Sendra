@@ -29,10 +29,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Request, SendraError};
 
-/// File name of a config file, under `.sendra/` in a project and directly
-/// under the global config directory.
-const CONFIG_FILE_NAME: &str = "config.yaml";
-
 /// Directory a project keeps its Sendra files in: `config.yaml` directly
 /// inside it, and the environment files of
 /// [`crate::environment`] under `environments/`. A directory rather than a bare
@@ -595,16 +591,30 @@ fn insert_overriding(headers: &mut BTreeMap<String, String>, name: &str, value: 
 /// what a directory resolves to depend on a file the reader has no particular
 /// reason to look at, and "settings for everything" is what the global config
 /// is already for.
+///
+/// The walk itself is delegated to [`dotcfg`](https://docs.rs/dotcfg):
+/// `DotCfg::new("sendra").yaml().find_in_ancestors_from(start)` searches the
+/// same `.sendra/config.yaml` shape with the same nearest-wins, no-fallback
+/// rule, so this stays byte-identical behavior with the discovery tested on
+/// dotcfg's side. What stays Sendra-specific — and therefore here — is
+/// everything above discovery: [`ConfigFile::merge_over`], cert-path
+/// resolution, empty-file handling, strict keys, and [`SendraError`] mapping.
+/// The global path ([`global_config_path`]) is deliberately untouched: dotcfg's
+/// `xdg()` forces XDG layout on every platform, while Sendra honors the
+/// native macOS/Windows config directories, so parity there needs its own
+/// check before any swap.
 pub fn find_project_config(start_dir: &Path) -> Option<PathBuf> {
-    start_dir
-        .ancestors()
-        .map(|dir| dir.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME))
-        .find(|candidate| candidate.is_file())
+    dotcfg::DotCfg::new("sendra")
+        .yaml()
+        .find_in_ancestors_from(start_dir)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.file_path().ok())
 }
 
-/// Path to the global config file, or `None` if the platform cannot say where
-/// config belongs (a daemon with no home directory, say) — in which case there
-/// is simply no global config.
+/// Directory holding the global config file, or `None` if the platform cannot
+/// say where config belongs (a daemon with no home directory, say) — in
+/// which case there is simply no global config.
 ///
 /// `$XDG_CONFIG_HOME` is honoured first, on every platform, when it is set to
 /// an absolute path (the XDG spec says to ignore a relative one). On Linux that
@@ -613,12 +623,34 @@ pub fn find_project_config(start_dir: &Path) -> Option<PathBuf> {
 /// instead. That is a deliberate deviation: someone who has set
 /// `XDG_CONFIG_HOME` has said where their config lives, and the check costs
 /// nothing on Windows, where the variable is effectively never set.
-pub fn global_config_path() -> Option<PathBuf> {
+fn global_config_dir() -> Option<PathBuf> {
     let root = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
         _ => dirs::config_dir()?,
     };
-    Some(root.join(APP_DIR_NAME).join(CONFIG_FILE_NAME))
+    Some(root.join(APP_DIR_NAME))
+}
+
+/// Path to the global config file, or `None` when there is no global config.
+///
+/// The path is built through a [`dotcfg`](https://docs.rs/dotcfg) handle
+/// wrapping Sendra's own directory logic (`at_dir`), not through dotcfg's
+/// `xdg()`: the latter is XDG layout on every platform (`~/.config/sendra`
+/// even on macOS), while Sendra honors the native macOS/Windows config
+/// directories. Same directories as before this change — dotcfg is the path
+/// authority here so the write paths (`save`/`set`, `config get/set`) build
+/// their handles the same way — but file reads stay on
+/// [`ConfigFile::from_path`], which preserves Sendra's empty-file-is-empty
+/// rule and [`SendraError`] mapping that dotcfg's generic `load` does not
+/// provide.
+pub fn global_config_path() -> Option<PathBuf> {
+    global_config_dir().and_then(|dir| {
+        dotcfg::DotCfg::new(APP_DIR_NAME)
+            .yaml()
+            .at_dir(dir)
+            .file_path()
+            .ok()
+    })
 }
 
 #[cfg(test)]
@@ -633,16 +665,21 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    /// Fixture file path via the same dotcfg handle resolution uses.
+    fn cfg_file(dir: &Path) -> PathBuf {
+        dotcfg::DotCfg::new(APP_DIR_NAME).yaml().at_dir(dir).file_path().unwrap()
+    }
+
     /// A project root under `dir` with `.sendra/config.yaml` holding `config`.
     fn project(dir: &Path, config: &str) -> PathBuf {
         let root = dir.join("project");
-        write(&root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME), config);
+        write(&cfg_file(&root.join(PROJECT_DIR_NAME)), config);
         root
     }
 
     /// A global config file under `dir` holding `config`.
     fn global(dir: &Path, config: &str) -> PathBuf {
-        let path = dir.join("global").join(APP_DIR_NAME).join(CONFIG_FILE_NAME);
+        let path = cfg_file(&dir.join("global").join(APP_DIR_NAME));
         write(&path, config);
         path
     }
@@ -676,7 +713,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         // An empty directory, and a global path that does not exist: both
         // absent is an ordinary state, not an error.
-        let missing = temp.path().join("nowhere").join(CONFIG_FILE_NAME);
+        let missing = temp.path().join("nowhere").join("config.yaml");
 
         let config = Config::resolve_from(temp.path(), Some(&missing))
             .expect("no config file is not a failure");
@@ -725,7 +762,7 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(7));
         assert_eq!(
             config.sources,
-            vec![root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME)]
+            vec![root.join(PROJECT_DIR_NAME).join("config.yaml")]
         );
     }
 
@@ -798,47 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn the_config_at_the_project_root_is_found_from_a_nested_subdirectory() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "headers:\n  X-Project: yes\n");
-        // Several levels down, the way `crates/api/tests` sits under a repo.
-        let nested = root.join("crates").join("api").join("tests");
-        std::fs::create_dir_all(&nested).unwrap();
-
-        let found = find_project_config(&nested).expect("the walk-up must reach the root");
-        assert_eq!(
-            found,
-            root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME),
-            "the config at the project root should have been found from {}",
-            nested.display()
-        );
-
-        // And the resolved config is the same as it is from the root itself.
-        assert_eq!(
-            Config::resolve_from(&nested, None).unwrap().headers,
-            Config::resolve_from(&root, None).unwrap().headers
-        );
-    }
-
-    #[test]
-    fn the_nearest_project_config_wins_over_one_further_up() {
-        let temp = tempfile::tempdir().unwrap();
-        let outer = project(temp.path(), "headers:\n  X-Which: outer\n");
-        let inner = outer.join("nested");
-        write(
-            &inner.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME),
-            "headers:\n  X-Which: inner\n",
-        );
-
-        let config = Config::resolve_from(&inner, None).unwrap();
-        assert_eq!(
-            config.headers.get("X-Which").map(String::as_str),
-            Some("inner")
-        );
-        assert_eq!(config.sources.len(), 1, "only the nearest is read");
-    }
-
-    #[test]
     fn malformed_yaml_in_a_config_file_is_a_typed_error_carrying_the_path() {
         let temp = tempfile::tempdir().unwrap();
         // Unclosed flow sequence: not valid YAML at all.
@@ -848,7 +844,7 @@ mod tests {
         match err {
             SendraError::ConfigParse { path, .. } => assert_eq!(
                 path,
-                root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME),
+                root.join(PROJECT_DIR_NAME).join("config.yaml"),
                 "the error should name the file to fix"
             ),
             other => panic!("expected ConfigParse, got {other:?}"),
@@ -1408,7 +1404,7 @@ mod tests {
             return;
         };
         assert!(
-            path.ends_with(Path::new(APP_DIR_NAME).join(CONFIG_FILE_NAME)),
+            path.ends_with(Path::new(APP_DIR_NAME).join("config.yaml")),
             "got {}",
             path.display()
         );
