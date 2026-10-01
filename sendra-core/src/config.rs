@@ -350,16 +350,47 @@ impl ConfigFile {
     }
 
     /// Read and parse a config file from disk.
+    ///
+    /// The strict parse goes through [`dotcfg`](https://docs.rs/dotcfg):
+    /// the file's own directory and stem become an `at_dir` handle and
+    /// `load` parses it with the same `deny_unknown_fields` rules the
+    /// struct declares. Anything dotcfg refuses — a missing file, an empty
+    /// file, a parse failure — falls through to the direct read below, so
+    /// empty-file-is-empty and the typed [`SendraError`] mapping (with the
+    /// file path attached) behave exactly as before.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, SendraError> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path).map_err(|source| SendraError::ConfigIo {
+        let wrap = |source| SendraError::ConfigParse {
             path: path.to_path_buf(),
             source,
+        };
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("config");
+        if let Ok(Some(file)) = dotcfg::DotCfg::new(APP_DIR_NAME)
+            .yaml()
+            .at_dir(dir)
+            .filename(stem)
+            .load::<Self>()
+        {
+            return Ok(file);
+        }
+        let raw = std::fs::read_to_string(path).map_err(|source| {
+            SendraError::ConfigIo {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
-        Self::parse(&raw, |source| SendraError::ConfigParse {
-            path: path.to_path_buf(),
-            source,
-        })
+        let probe: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(&wrap)?;
+        if probe.is_null() {
+            return Ok(Self::default());
+        }
+        Self::parse(&raw, wrap)
     }
 
     /// Shared body of the two constructors; `wrap` supplies the error variant
